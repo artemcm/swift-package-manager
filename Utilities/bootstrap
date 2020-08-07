@@ -91,6 +91,10 @@ def add_build_args(parser):
         help="path to the swift compiler",
         metavar="PATH")
     parser.add_argument(
+        "--swift-frontend-path",
+        help="path to the swift compiler frontend",
+        metavar="PATH")
+    parser.add_argument(
         "--clang-path",
         help="path to the clang compiler",
         metavar="PATH")
@@ -173,6 +177,7 @@ def parse_build_args(args):
         args.llbuild_build_dir = os.path.abspath(args.llbuild_build_dir)
 
     args.swiftc_path = get_swiftc_path(args)
+    args.swift_frontend_path = get_swift_frontend_path(args)
     args.clang_path = get_clang_path(args)
     args.cmake_path = get_cmake_path(args)
     args.ninja_path = get_ninja_path(args)
@@ -206,6 +211,21 @@ def get_swiftc_path(args):
     if os.path.exists(swiftc_path):
         return swiftc_path
     error("unable to find swiftc at %s" % swiftc_path)
+
+def get_swift_frontend_path(args):
+    """Returns the path to the Swift frontend."""
+    if args.swift_frontend_path:
+        return os.path.abspath(args.swift_frontend_path)
+    elif os.getenv("SWIFT_DRIVER_SWIFT_FRONTEND_EXEC"):
+        swiftc_path = os.path.realpath(os.getenv("SWIFT_DRIVER_SWIFT_FRONTEND_EXEC"))
+    elif platform.system() == 'Darwin':
+        return call_output(
+            ["xcrun", "--find", "swift-frontend"],
+            stderr=subprocess.PIPE,
+            verbose=args.verbose
+        )
+    else:
+        return call_output(["which", "swift-frontend"], verbose=args.verbose)
 
 def get_clang_path(args):
     """Returns the path to the Clang compiler."""
@@ -529,6 +549,7 @@ def build_swiftpm_with_swiftpm(args, integrated_swift_driver):
     swiftpm_args = [
         "SWIFT_EXEC=" + args.swiftc_path,
         "SWIFT_DRIVER_SWIFT_EXEC=" + args.swiftc_path,
+        "SWIFT_DRIVER_SWIFT_FRONTEND_EXEC=" + args.swift_frontend_path,
         "SWIFTPM_PD_LIBS=" + os.path.join(args.bootstrap_dir, "pm"),
         os.path.join(args.bootstrap_dir, "bin/swift-build"),
         "--disable-sandbox",
