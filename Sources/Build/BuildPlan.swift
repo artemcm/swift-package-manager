@@ -517,6 +517,11 @@ public final class SwiftTargetBuildDescription {
     /// Paths to the binary libraries the target depends on.
     fileprivate(set) var libraryBinaryPaths: Set<AbsolutePath> = []
 
+    /// The path to a serialized  inter-module dependency graph.
+    var serializedInterModuleDependencyGraphPath: AbsolutePath {
+        return buildParameters.buildPath.appending(component: target.c99name + "-dependencies.json")
+    }
+
     /// Any addition flags to be added. These flags are expected to be computed during build planning.
     fileprivate var additionalFlags: [String] = []
 
@@ -826,8 +831,9 @@ public final class SwiftTargetBuildDescription {
             // FIXME: Need to record this deps file for processing it later.
             stream <<< "    \"object\": \"" <<< tempsPath.appending(component: moduleName + ".o") <<< "\",\n"
         }
-        stream <<< "    \"swift-dependencies\": \"" <<< masterDepsPath.pathString <<< "\"\n"
-
+        stream <<< "    \"swift-dependencies\": \"" <<< masterDepsPath.pathString <<< "\",\n"
+        stream <<< "    \"json-module-dependencies\": \"" <<<
+            serializedInterModuleDependencyGraphPath.pathString <<< "\"\n"
         stream <<< "  },\n"
 
         // Write out the entries for each source file.
