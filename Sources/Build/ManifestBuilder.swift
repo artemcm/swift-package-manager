@@ -316,10 +316,9 @@ extension LLBuildManifestBuilder {
             ResolvedTarget.Dependency.target($0, conditions: [])
         }
         let allPackageDependencies = try topologicalSort(nodes, successors: { $0.dependencies })
-
         // Instantiate the inter-module dependency oracle which will cache commonly-scanned
         // modules across targets' Driver instances.
-        let dependencyOracle = try InterModuleDependencyOracle()
+        let dependencyOracle = InterModuleDependencyOracle()
 
         // Create commands for all target descriptions in the plan.
         for dependency in allPackageDependencies.reversed() {
