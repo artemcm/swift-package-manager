@@ -19,6 +19,7 @@ import PackageGraph
 import SPMBuildCore
 
 @_implementationOnly import SwiftDriver
+import Foundation
 
 public class LLBuildManifestBuilder {
     public enum TargetKind {
@@ -63,6 +64,7 @@ public class LLBuildManifestBuilder {
             // Currently behind:
             // --experimental-explicit-module-build
             try addTargetsToExplicitBuildManifest()
+            //try addTargetsToExplicitBuildManifestLEGACY()
         } else {
             // Create commands for all target descriptions in the plan.
             for (_, description) in plan.targetMap {
@@ -89,6 +91,8 @@ public class LLBuildManifestBuilder {
             stdoutStream.flush()
         }
 
+        print("Manifest Creation Complete.")
+        exit(0)
         try ManifestWriter().write(manifest, at: path)
     }
 
@@ -309,48 +313,180 @@ extension LLBuildManifestBuilder {
     // dependency graph of B. The driver is then responsible for the necessary post-processing
     // to merge the dependency graphs and plan the build for A, using artifacts of B as explicit
     // inputs.
-    public func addTargetsToExplicitBuildManifest() throws {
-        // Sort the product targets in topological order in order to collect and "bubble up"
-        // their respective dependency graphs to the depending targets.
-        let nodes: [ResolvedTarget.Dependency] = plan.targetMap.keys.map {
-            ResolvedTarget.Dependency.target($0, conditions: [])
+    private func addTargetsToExplicitBuildManifest() throws {
+        let allTargets: [ResolvedTarget] = Array(plan.targetMap.keys)
+        let clangTargets = try allTargets.filter { target in
+            switch plan.targetMap[target] {
+            case .clang(_): return true
+            case .swift(_): return false
+            case .none: throw InternalError("Expected description for target \(target)")
+            }
         }
-        let allPackageDependencies = try topologicalSort(nodes, successors: { $0.dependencies })
-        // Instantiate the inter-module dependency oracle which will cache commonly-scanned
-        // modules across targets' Driver instances.
-        let dependencyOracle = InterModuleDependencyOracle()
+        // First, separately process Clang targets
+        for target in clangTargets {
+            guard let description = plan.targetMap[target],
+                  case .clang(let clangDesc) = description else {
+                throw InternalError("Expected Clang description for target \(target)")
+            }
+            try self.createClangCompileCommand(clangDesc)
+        }
 
-        // Create commands for all target descriptions in the plan.
-        for dependency in allPackageDependencies.reversed() {
-            guard case .target(let target, _) = dependency else {
-                // Product dependency build jobs are added after the fact.
-                // Targets that depend on product dependencies will expand the corresponding
-                // product into its constituent targets.
-                continue
+        // Second, plan the build for Swift targets and add their respective commands
+        let swiftTargetBuildPlans = try computeSwiftTargetExplicitBuildPlans(allTargets)
+        for (target, jobs) in swiftTargetBuildPlans {
+            guard let targetDescription = plan.targetMap[target],
+                  case .swift(let swiftDescription) = targetDescription else {
+                throw InternalError("Expected Swift Target description for target \(target)")
             }
-            guard target.underlyingTarget.type != .systemModule,
-                  target.underlyingTarget.type != .binary else {
-                // Much like non-Swift targets, system modules will consist of a modulemap
-                // somewhere in the filesystem, with the path to that module being either
-                // manually-specified or computed based on the system module type (apt, brew).
-                // Similarly, binary targets will bring in an .xcframework, the contents of
-                // which will be exposed via search paths.
-                //
-                // In both cases, the dependency scanning action in the driver will be automatically
-                // be able to detect such targets' modules.
-                continue
-            }
-            guard let description = plan.targetMap[target] else {
-                throw InternalError("Expected description for target \(target)")
-            }
-            switch description {
-                case .swift(let desc):
-                    try self.createExplicitSwiftTargetCompileCommand(description: desc,
-                                                                     dependencyOracle: dependencyOracle)
-                case .clang(let desc):
-                    try self.createClangCompileCommand(desc)
+
+            let inputs = try self.computeSwiftCompileCmdInputs(swiftDescription)
+
+            // Commands.
+            let resolver = try ArgsResolver(fileSystem: swiftDescription.fs)
+            try addSwiftDriverJobs(for: swiftDescription, jobs: jobs, inputs: inputs,
+                                   resolver: resolver, isMainModule: { _ in return false })
+
+            // Outputs.
+            let objectNodes = swiftDescription.objects.map(Node.file)
+            let moduleNode = Node.file(swiftDescription.moduleOutputPath)
+            let cmdOutputs = objectNodes + [moduleNode]
+
+            self.addTargetCmd(swiftDescription, cmdOutputs: cmdOutputs)
+            self.addModuleWrapCmd(swiftDescription)
+        }
+    }
+
+    private func computeSwiftTargetExplicitBuildPlans(_ allTargets: [ResolvedTarget])
+    throws -> [ResolvedTarget: [Job]] {
+        let swiftTargets = try allTargets.filter { target in
+            switch plan.targetMap[target] {
+            case .clang(_): return false
+            case .swift(_): return true
+            case .none: throw InternalError("Expected description for target \(target)")
             }
         }
+        let dependencyOracle = InterModuleDependencyOracle()
+        print("------------------ ASYNC EXPERIMENT ------------------")
+        var result: [ResolvedTarget: [Job]] = [:]
+        runAsyncAndBlock {
+            typealias taskResultTy = (ResolvedTarget, [Job])
+            typealias groupResultTy = [ResolvedTarget: [Job]]
+            result = try! await Task.withGroup(resultType: taskResultTy.self,
+                                               returning: groupResultTy.self) { group in
+                var groupResult: [ResolvedTarget: [Job]] = [:]
+                // The collection of all dependencies we will plan, removing targets from it as
+                // we enque the target's planning task
+                var targetsToPlan = swiftTargets
+                // A dictionary to keep track of which targets have already been planned,
+                // used to enque successive targets that can be planned only once their dependenices
+                // have been planned.
+                var doneMap: [ResolvedTarget: Bool] =
+                    allTargets.reduce(into: [ResolvedTarget: Bool]()) {
+                        // We do not depend on planning Clang targets as those have all been
+                        // planned before this
+                        switch self.plan.targetMap[$1]! {
+                        case .clang(_): $0[$1] = true
+                        case .swift(_): $0[$1] = false
+                        }
+                    }
+
+                // Scan the list of remaining targets to plan, checking, for each, whether
+                // its target dependencies have finished planning.
+                func submitTargets() async throws {
+                    let submission = try targetsToPlan.filter {
+                        try Self.readyToPlan($0, doneMap: &doneMap)
+                    }
+                    targetsToPlan = targetsToPlan.filter { !submission.contains($0) }
+                    for target in submission {
+                        await group.add {
+                            return (target,
+                                    try self.planSwiftTargetBuild(target,
+                                                                  dependencyOracle: dependencyOracle))
+                        }
+                    }
+                }
+
+                // submit initial tasks
+                try await submitTargets()
+
+                // as each task completes, submit new tasks until we run out of work
+                while let taskResult = try! await group.next() {
+                    doneMap[taskResult.0] = true
+                    groupResult[taskResult.0] = taskResult.1
+                    try await Task.checkCancellation()
+                    try await submitTargets()
+                }
+                assert(groupResult.count == swiftTargets.count)
+                return groupResult
+            }
+        }
+        print("------------------------------------------------------")
+        return result
+    }
+
+    private func planSwiftTargetBuild(
+        _ target: ResolvedTarget,
+        dependencyOracle: InterModuleDependencyOracle
+    ) throws -> [Job] {
+        print("Driver Planning Build of: \(target.c99name)")
+        guard let targetDescription = plan.targetMap[target],
+              case .swift(let swiftDescription) = targetDescription else {
+            throw InternalError("Expected Swift Target description for target \(target)")
+        }
+        // Pass the driver its external dependencies (target dependencies)
+        var dependencyModulePathMap: SwiftDriver.ExternalTargetModulePathMap = [:]
+        // Collect paths for target dependencies of this target (direct and transitive)
+        try self.collectTargetDependencyModulePaths(for: target,
+                                                    dependencyModulePathMap: &dependencyModulePathMap)
+
+        // Compute the set of frontend
+        // jobs needed to build this Swift target.
+        var commandLine = try swiftDescription.emitCommandLine();
+        commandLine.append("-driver-use-frontend-path")
+        commandLine.append(buildParameters.toolchain.swiftCompiler.pathString)
+        commandLine.append("-experimental-explicit-module-build")
+        let resolver = try ArgsResolver(fileSystem: swiftDescription.fs)
+        let executor = SPMSwiftDriverExecutor(resolver: resolver,
+                                              fileSystem: swiftDescription.fs,
+                                              env: ProcessEnv.vars)
+        var driver = try Driver(args: commandLine, fileSystem: swiftDescription.fs,
+                                executor: executor,
+                                externalTargetModulePathMap: dependencyModulePathMap,
+                                interModuleDependencyOracle: dependencyOracle)
+        let jobs: [Job] = try driver.planBuild()
+        return jobs
+    }
+
+    private static func readyToPlan(_ target: ResolvedTarget,
+                                    doneMap: inout [ResolvedTarget: Bool]) throws -> Bool {
+        // Ensure target dependencies have been planned
+        let targetDependencies = target.dependencies
+            .filter({
+                if case .target(_, _) = $0 {
+                    return true
+                } else {
+                    return false
+                }
+            }).map { $0.target! }
+        if !targetDependencies.allSatisfy({doneMap[$0] == true}) {
+            return false
+        }
+
+        // Break down product dependencies into targets and check each one of those as well.
+        let productDependencies = target.dependencies
+            .filter({
+                if case .product(_, _) = $0 {
+                    return true
+                } else {
+                    return false
+                }
+            }).map { $0.product! }
+        if !productDependencies.allSatisfy({product in
+                                             product.targets.allSatisfy({doneMap[$0] == true})}) {
+            return false
+        }
+
+        return true
     }
 
     private func createExplicitSwiftTargetCompileCommand(
@@ -360,14 +496,14 @@ extension LLBuildManifestBuilder {
         // Inputs.
         let inputs = try self.computeSwiftCompileCmdInputs(description)
 
+        // Commands.
+        try addExplicitBuildSwiftCmds(description, inputs: inputs,
+                                      dependencyOracle: dependencyOracle)
+
         // Outputs.
         let objectNodes = description.objects.map(Node.file)
         let moduleNode = Node.file(description.moduleOutputPath)
         let cmdOutputs = objectNodes + [moduleNode]
-
-        // Commands.
-        try addExplicitBuildSwiftCmds(description, inputs: inputs,
-                                      dependencyOracle: dependencyOracle)
 
         self.addTargetCmd(description, cmdOutputs: cmdOutputs)
         self.addModuleWrapCmd(description)
