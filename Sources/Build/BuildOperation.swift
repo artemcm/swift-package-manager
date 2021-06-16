@@ -17,6 +17,8 @@ import SPMLLBuild
 import TSCBasic
 import TSCUtility
 
+@_implementationOnly import SwiftDriver
+
 public final class BuildOperation: PackageStructureDelegate, SPMBuildCore.BuildSystem, BuildErrorAdviceProvider {
 
     /// The delegate used by the build system.
@@ -118,10 +120,49 @@ public final class BuildOperation: PackageStructureDelegate, SPMBuildCore.BuildS
         buildSystem?.cancel()
     }
 
+    // Emit a warning if a target imports another target in this build
+    // without specifying it as a dependency in the manifest
+    private func verifyTargetImports(in description: BuildDescription) throws {
+        for (target, commandLine) in description.swiftTargetScanArgs {
+            do {
+                guard let dependencies = description.targetDependencyMap[target] else {
+                    // Skip target if no dependency information is present
+                    continue
+                }
+                let resolver = try ArgsResolver(fileSystem: localFileSystem)
+                let executor = SPMSwiftDriverExecutor(resolver: resolver,
+                                                      fileSystem: localFileSystem,
+                                                      env: ProcessEnv.vars)
+                var driver = try Driver(args: commandLine,
+                                        diagnosticsEngine: diagnostics,
+                                        fileSystem: localFileSystem,
+                                        executor: executor)
+                let imports = try driver.performImportPrescan().imports
+                let targetDependenciesSet = Set(dependencies)
+                let nonDependencyTargetsSet =
+                    Set(description.targetDependencyMap.keys.filter { !targetDependenciesSet.contains($0) })
+                let importedTargetsMissingDependency = Set(imports).intersection(nonDependencyTargetsSet)
+                if let missedDependency = importedTargetsMissingDependency.first {
+                    diagnostics.emit(warning: "Target \(target) imports another target (\(missedDependency)) in the package without declaring it a dependency.", location: nil)
+                }
+            } catch {
+                // The above verification is a best-effort attempt to warn the user about a potential manifest
+                // error. If something went wrong during the import-prescan, proceed silently.
+                return
+            }
+        }
+    }
+
     /// Perform a build using the given build description and subset.
     public func build(subset: BuildSubset) throws {
+        // Get the build description
+        let buildDescription = try getBuildDescription()
+
+        // Verify dependency imports on the described targers
+        try verifyTargetImports(in: buildDescription)
+
         // Create the build system.
-        let buildSystem = try createBuildSystem(with: getBuildDescription())
+        let buildSystem = try createBuildSystem(with: buildDescription)
         self.buildSystem = buildSystem
 
         // Perform the build.
